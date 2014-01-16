@@ -33,7 +33,6 @@
 #include <trace/events/power.h>
 #include <mach/socinfo.h>
 #include <mach/cpufreq.h>
-#include <mach/msm_bus.h>
 
 #include "acpuclock.h"
 
@@ -48,16 +47,12 @@ static DEFINE_MUTEX(l2bw_lock);
 static struct clk *cpu_clk[NR_CPUS];
 static struct clk *l2_clk;
 static unsigned int freq_index[NR_CPUS];
+static unsigned int max_freq_index;
 static struct cpufreq_frequency_table *freq_table;
 static unsigned int *l2_khz;
 static bool is_clk;
 static bool is_sync;
-static struct msm_bus_vectors *bus_vec_lst;
-static struct msm_bus_scale_pdata bus_bw = {
-	.name = "msm-cpufreq",
-	.active_only = 1,
-};
-static u32 bus_client;
+static unsigned long *mem_bw;
 
 struct cpufreq_work_struct {
 	struct work_struct work;
@@ -78,15 +73,10 @@ struct cpufreq_suspend_t {
 
 static DEFINE_PER_CPU(struct cpufreq_suspend_t, cpufreq_suspend);
 
-struct cpu_freq {
-	uint32_t max;
-	uint32_t min;
-	uint32_t allowed_max;
-	uint32_t allowed_min;
-	uint32_t limits_init;
-};
-
-static DEFINE_PER_CPU(struct cpu_freq, cpu_freq_info);
+unsigned long msm_cpufreq_get_bw(void)
+{
+	return mem_bw[max_freq_index];
+}
 
 static void update_l2_bw(int *also_cpu)
 {
@@ -109,10 +99,10 @@ static void update_l2_bw(int *also_cpu)
 		goto out;
 	}
 
-	if (bus_client)
-		rc = msm_bus_scale_client_update_request(bus_client, index);
+	max_freq_index = index;
+	rc = devfreq_msm_cpufreq_update_bw();
 	if (rc)
-		pr_err("Bandwidth req failed (%d)\n", rc);
+		pr_err("Unable to update BW (%d)\n", rc);
 
 out:
 	mutex_unlock(&l2bw_lock);
@@ -125,27 +115,7 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq,
 	int saved_sched_policy = -EINVAL;
 	int saved_sched_rt_prio = -EINVAL;
 	struct cpufreq_freqs freqs;
-	struct cpu_freq *limit = &per_cpu(cpu_freq_info, policy->cpu);
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
-	struct cpufreq_frequency_table *table;
-
-	if (limit->limits_init) {
-		if (new_freq > limit->allowed_max) {
-			new_freq = limit->allowed_max;
-			pr_debug("max: limiting freq to %d\n", new_freq);
-		}
-
-		if (new_freq < limit->allowed_min) {
-			new_freq = limit->allowed_min;
-			pr_debug("min: limiting freq to %d\n", new_freq);
-		}
-	}
-
-	/* limits applied above must be in cpufreq table */
-	table = cpufreq_frequency_get_table(policy->cpu);
-	if (cpufreq_frequency_table_target(policy, table, new_freq,
-		CPUFREQ_RELATION_H, &index))
-		return -EINVAL;
 
 	freqs.old = policy->cur;
 	freqs.new = new_freq;
@@ -264,67 +234,6 @@ static unsigned int msm_cpufreq_get_freq(unsigned int cpu)
 	return acpuclk_get_rate(cpu);
 }
 
-static inline int msm_cpufreq_limits_init(void)
-{
-	int cpu = 0;
-	int i = 0;
-	struct cpufreq_frequency_table *table = NULL;
-	uint32_t min = (uint32_t) -1;
-	uint32_t max = 0;
-	struct cpu_freq *limit = NULL;
-
-	for_each_possible_cpu(cpu) {
-		limit = &per_cpu(cpu_freq_info, cpu);
-		table = cpufreq_frequency_get_table(cpu);
-		if (table == NULL) {
-			pr_err("%s: error reading cpufreq table for cpu %d\n",
-					__func__, cpu);
-			continue;
-		}
-		for (i = 0; (table[i].frequency != CPUFREQ_TABLE_END); i++) {
-			if (table[i].frequency > max)
-				max = table[i].frequency;
-			if (table[i].frequency < min)
-				min = table[i].frequency;
-		}
-		limit->allowed_min = min;
-		limit->allowed_max = max;
-		limit->min = min;
-		limit->max = max;
-		limit->limits_init = 1;
-	}
-
-	return 0;
-}
-
-int msm_cpufreq_set_freq_limits(uint32_t cpu, uint32_t min, uint32_t max)
-{
-	struct cpu_freq *limit = &per_cpu(cpu_freq_info, cpu);
-
-	if (!limit->limits_init)
-		msm_cpufreq_limits_init();
-
-	if ((min != MSM_CPUFREQ_NO_LIMIT) &&
-		min >= limit->min && min <= limit->max)
-		limit->allowed_min = min;
-	else
-		limit->allowed_min = limit->min;
-
-
-	if ((max != MSM_CPUFREQ_NO_LIMIT) &&
-		max <= limit->max && max >= limit->min)
-		limit->allowed_max = max;
-	else
-		limit->allowed_max = limit->max;
-
-	pr_debug("%s: Limiting cpu %d min = %d, max = %d\n",
-			__func__, cpu,
-			limit->allowed_min, limit->allowed_max);
-
-	return 0;
-}
-EXPORT_SYMBOL(msm_cpufreq_set_freq_limits);
-
 static int __cpuinit msm_cpufreq_init(struct cpufreq_policy *policy)
 {
 	int cur_freq;
@@ -416,11 +325,15 @@ static int __cpuinit msm_cpufreq_cpu_callback(struct notifier_block *nfb,
 	case CPU_UP_CANCELED:
 		if (is_clk) {
 			clk_disable_unprepare(cpu_clk[cpu]);
+			clk_disable_unprepare(l2_clk);
 			update_l2_bw(NULL);
 		}
 		break;
 	case CPU_UP_PREPARE:
 		if (is_clk) {
+			rc = clk_prepare_enable(l2_clk);
+			if (rc < 0)
+				return NOTIFY_BAD;
 			rc = clk_prepare_enable(cpu_clk[cpu]);
 			if (rc < 0)
 				return NOTIFY_BAD;
@@ -485,32 +398,13 @@ static struct cpufreq_driver msm_cpufreq_driver = {
 };
 
 #define PROP_TBL "qcom,cpufreq-table"
-#define PROP_PORTS "qcom,cpu-mem-ports"
 static int cpufreq_parse_dt(struct device *dev)
 {
-	int ret, len, nf, num_cols = 1, num_paths = 0, i, j, k;
-	u32 *data, *ports = NULL;
-	struct msm_bus_vectors *v = NULL;
+	int ret, len, nf, num_cols = 2, i, j;
+	u32 *data;
 
 	if (l2_clk)
 		num_cols++;
-
-	/* Parse optional bus ports parameter */
-	if (of_find_property(dev->of_node, PROP_PORTS, &len)) {
-		len /= sizeof(*ports);
-		if (len % 2)
-			return -EINVAL;
-
-		ports = devm_kzalloc(dev, len * sizeof(*ports), GFP_KERNEL);
-		if (!ports)
-			return -ENOMEM;
-		ret = of_property_read_u32_array(dev->of_node, PROP_PORTS,
-						 ports, len);
-		if (ret)
-			return ret;
-		num_paths = len / 2;
-		num_cols++;
-	}
 
 	/* Parse CPU freq -> L2/Mem BW map table. */
 	if (!of_find_property(dev->of_node, PROP_TBL, &len))
@@ -532,21 +426,14 @@ static int cpufreq_parse_dt(struct device *dev)
 	/* Allocate all data structures. */
 	freq_table = devm_kzalloc(dev, (nf + 1) * sizeof(*freq_table),
 				  GFP_KERNEL);
-	if (!freq_table)
+	mem_bw = devm_kzalloc(dev, nf * sizeof(*mem_bw), GFP_KERNEL);
+
+	if (!freq_table || !mem_bw)
 		return -ENOMEM;
 
 	if (l2_clk) {
 		l2_khz = devm_kzalloc(dev, nf * sizeof(*l2_khz), GFP_KERNEL);
 		if (!l2_khz)
-			return -ENOMEM;
-	}
-
-	if (num_paths) {
-		int sz_u = nf * sizeof(*bus_bw.usecase);
-		int sz_v = nf * num_paths * sizeof(*bus_vec_lst);
-		bus_bw.usecase = devm_kzalloc(dev, sz_u, GFP_KERNEL);
-		v = bus_vec_lst = devm_kzalloc(dev, sz_v, GFP_KERNEL);
-		if (!bus_bw.usecase || !bus_vec_lst)
 			return -ENOMEM;
 	}
 
@@ -592,25 +479,12 @@ static int cpufreq_parse_dt(struct device *dev)
 			}
 		}
 
-		if (num_paths) {
-			unsigned int bw_mbps = data[j++];
-			bus_bw.usecase[i].num_paths = num_paths;
-			bus_bw.usecase[i].vectors = v;
-			for (k = 0; k < num_paths; k++) {
-				v->src = ports[k * 2];
-				v->dst = ports[k * 2 + 1];
-				v->ib = bw_mbps * 1000000ULL;
-				v++;
-			}
-		}
+		mem_bw[i] = data[j++];
 	}
 
-	bus_bw.num_usecases = i;
 	freq_table[i].index = i;
 	freq_table[i].frequency = CPUFREQ_TABLE_END;
 
-	if (ports)
-		devm_kfree(dev, ports);
 	devm_kfree(dev, data);
 
 	return 0;
@@ -620,15 +494,12 @@ static int cpufreq_parse_dt(struct device *dev)
 static int msm_cpufreq_show(struct seq_file *m, void *unused)
 {
 	unsigned int i, cpu_freq;
-	uint64_t ib;
 
 	if (!freq_table)
 		return 0;
 
 	seq_printf(m, "%10s%10s", "CPU (KHz)", "L2 (KHz)");
-	if (bus_bw.usecase)
-		seq_printf(m, "%12s", "Mem (MBps)");
-	seq_printf(m, "\n");
+	seq_printf(m, "%12s\n", "Mem (MBps)");
 
 	for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
 		cpu_freq = freq_table[i].frequency;
@@ -636,11 +507,7 @@ static int msm_cpufreq_show(struct seq_file *m, void *unused)
 			continue;
 		seq_printf(m, "%10d", cpu_freq);
 		seq_printf(m, "%10d", l2_khz ? l2_khz[i] : cpu_freq);
-		if (bus_bw.usecase) {
-			ib = bus_bw.usecase[i].vectors[0].ib;
-			do_div(ib, 1000000);
-			seq_printf(m, "%12llu", ib);
-		}
+		seq_printf(m, "%12lu", mem_bw[i]);
 		seq_printf(m, "\n");
 	}
 	return 0;
@@ -690,10 +557,10 @@ static int __init msm_cpufreq_probe(struct platform_device *pdev)
 		cpufreq_frequency_table_get_attr(freq_table, cpu);
 	}
 
-	if (bus_bw.usecase) {
-		bus_client = msm_bus_scale_register_client(&bus_bw);
-		if (!bus_client)
-			dev_warn(dev, "Unable to register bus client\n");
+	ret = register_devfreq_msm_cpufreq();
+	if (ret) {
+		pr_err("devfreq governor registration failed\n");
+		return ret;
 	}
 
 	is_clk = true;
