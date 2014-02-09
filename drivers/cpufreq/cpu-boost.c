@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,6 +17,7 @@
 #include <linux/init.h>
 #include <linux/notifier.h>
 #include <linux/cpufreq.h>
+#include <linux/cpu.h>
 #include <linux/sched.h>
 #include <linux/jiffies.h>
 #include <linux/smpboot.h>
@@ -26,7 +27,6 @@
 #include <linux/time.h>
 
 struct cpu_sync {
-	wait_queue_head_t sync_wq;
 	struct delayed_work boost_rem;
 	struct delayed_work input_boost_rem;
 	int cpu;
@@ -167,9 +167,15 @@ static void run_boost_migration(unsigned int cpu)
 	}
 
 	/* Force policy re-evaluation to trigger adjust notifier. */
-	cpufreq_update_policy(dest_cpu);
-	queue_delayed_work_on(s->cpu, cpu_boost_wq,
-		&s->boost_rem, msecs_to_jiffies(boost_ms));
+	get_online_cpus();
+	if (cpu_online(dest_cpu)) {
+		cpufreq_update_policy(dest_cpu);
+		queue_delayed_work_on(dest_cpu, cpu_boost_wq,
+			&s->boost_rem, msecs_to_jiffies(boost_ms));
+	} else {
+		s->boost_min = 0;
+	}
+	put_online_cpus();
 }
 
 static struct smp_hotplug_thread cpuboost_threads = {
@@ -193,7 +199,6 @@ static int boost_migration_notify(struct notifier_block *nb,
 	s->pending = true;
 	s->src_cpu = (int) arg;
 	spin_unlock_irqrestore(&s->lock, flags);
-	wake_up(&s->sync_wq);
 
 	return NOTIFY_OK;
 }
@@ -208,6 +213,7 @@ static void do_input_boost(struct work_struct *work)
 	struct cpu_sync *i_sync_info;
 	struct cpufreq_policy policy;
 
+	get_online_cpus();
 	for_each_online_cpu(i) {
 
 		i_sync_info = &per_cpu(sync_info, i);
@@ -224,6 +230,7 @@ static void do_input_boost(struct work_struct *work)
 			&i_sync_info->input_boost_rem,
 			msecs_to_jiffies(input_boost_ms));
 	}
+	put_online_cpus();
 }
 
 static void cpuboost_input_event(struct input_handle *handle,
@@ -332,7 +339,6 @@ static int cpu_boost_init(void)
 	for_each_possible_cpu(cpu) {
 		s = &per_cpu(sync_info, cpu);
 		s->cpu = cpu;
-		init_waitqueue_head(&s->sync_wq);
 		spin_lock_init(&s->lock);
 		INIT_DELAYED_WORK(&s->boost_rem, do_boost_rem);
 		INIT_DELAYED_WORK(&s->input_boost_rem, do_input_boost_rem);
