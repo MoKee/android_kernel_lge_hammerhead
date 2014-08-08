@@ -212,6 +212,8 @@ disp_en_gpio_err:
 int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 {
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
+	struct mdss_panel_info *pinfo = NULL;
+	int rc = 0;
 
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
@@ -224,9 +226,6 @@ int mdss_dsi_panel_reset(struct mdss_panel_data *pdata, int enable)
 	prevent_sleep = prevent_sleep || (dt2w_switch > 0);
 #endif
 #endif
-
-	struct mdss_panel_info *pinfo = NULL;
-	int rc = 0;
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
