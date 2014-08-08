@@ -321,6 +321,8 @@ static int mdss_mdp_video_stop(struct mdss_mdp_ctl *ctl)
 		WARN(rc, "intf %d blank error (%d)\n", ctl->intf_num, rc);
 
 		mdp_video_write(ctx, MDSS_MDP_REG_INTF_TIMING_ENGINE_EN, 0);
+
+		mdss_iommu_ctrl(0);
 		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 		ctx->timegen_en = false;
 
@@ -488,6 +490,7 @@ static void mdss_mdp_video_underrun_intr_done(void *arg)
 static int mdss_mdp_video_display(struct mdss_mdp_ctl *ctl, void *arg)
 {
 	struct mdss_mdp_video_ctx *ctx;
+	struct mdss_panel_data *pdata = ctl->panel_data;
 	int rc;
 
 	pr_debug("kickoff ctl=%d\n", ctl->num);
@@ -519,6 +522,17 @@ static int mdss_mdp_video_display(struct mdss_mdp_ctl *ctl, void *arg)
 		}
 
 		pr_debug("enabling timing gen for intf=%d\n", ctl->intf_num);
+
+		if (pdata->panel_info.cont_splash_enabled) {
+			rc = wait_for_completion_timeout(&ctx->vsync_comp,
+					usecs_to_jiffies(VSYNC_TIMEOUT_US));
+		}
+
+		rc = mdss_iommu_ctrl(1);
+		if (IS_ERR_VALUE(rc)) {
+			pr_err("IOMMU attach failed\n");
+			return rc;
+		}
 
 		mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
 

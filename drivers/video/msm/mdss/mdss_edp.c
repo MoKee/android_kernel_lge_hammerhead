@@ -183,26 +183,7 @@ static int mdss_edp_pwm_config(struct mdss_edp_drv_pdata *edp_drv)
 		return -EIO;
 	}
 
-	edp_drv->gpio_panel_pwm = of_get_named_gpio(edp_drv->pdev->dev.of_node,
-			"gpio-panel-pwm", 0);
-	if (!gpio_is_valid(edp_drv->gpio_panel_pwm)) {
-		pr_err("%s: gpio_panel_pwm=%d not specified\n", __func__,
-				edp_drv->gpio_panel_pwm);
-		goto edp_free_pwm;
-	}
-
-	ret = gpio_request(edp_drv->gpio_panel_pwm, "disp_pwm");
-	if (ret) {
-		pr_err("%s: Request reset gpio_panel_pwm failed, ret=%d\n",
-				__func__, ret);
-		goto edp_free_pwm;
-	}
-
 	return 0;
-
-edp_free_pwm:
-	pwm_free(edp_drv->bl_pwm);
-	return -ENODEV;
 }
 
 void mdss_edp_set_backlight(struct mdss_panel_data *pdata, u32 bl_level)
@@ -706,10 +687,15 @@ static int __devexit mdss_edp_remove(struct platform_device *pdev)
 static int mdss_edp_device_register(struct mdss_edp_drv_pdata *edp_drv)
 {
 	int ret;
+	u32 tmp;
 
 	mdss_edp_edid2pinfo(edp_drv);
 	edp_drv->panel_data.panel_info.bl_min = 1;
 	edp_drv->panel_data.panel_info.bl_max = 255;
+	ret = of_property_read_u32(edp_drv->pdev->dev.of_node,
+		"qcom,mdss-brightness-max-level", &tmp);
+	edp_drv->panel_data.panel_info.brightness_max =
+		(!ret ? tmp : MDSS_MAX_BL_BRIGHTNESS);
 
 	edp_drv->panel_data.event_handler = mdss_edp_event_handler;
 	edp_drv->panel_data.set_backlight = mdss_edp_set_backlight;
@@ -1007,6 +993,20 @@ static int __devinit mdss_edp_probe(struct platform_device *pdev)
 {
 	int ret;
 	struct mdss_edp_drv_pdata *edp_drv;
+	struct mdss_panel_cfg *pan_cfg = NULL;
+
+	if (!mdss_is_ready()) {
+		pr_err("%s: MDP not probed yet!\n", __func__);
+		return -EPROBE_DEFER;
+	}
+
+	pan_cfg = mdss_panel_intf_type(MDSS_PANEL_INTF_EDP);
+	if (IS_ERR(pan_cfg)) {
+		return PTR_ERR(pan_cfg);
+	} else if (!pan_cfg) {
+		pr_debug("%s: not configured as prim\n", __func__);
+		return -ENODEV;
+	}
 
 	if (!pdev->dev.of_node) {
 		pr_err("%s: Failed\n", __func__);

@@ -23,6 +23,8 @@
 
 #include <mach/iommu_domains.h>
 
+#include "mdss_panel.h"
+
 #define MDSS_REG_WRITE(addr, val) writel_relaxed(val, mdss_res->mdp_base + addr)
 #define MDSS_REG_READ(addr) readl_relaxed(mdss_res->mdp_base + addr)
 
@@ -90,6 +92,15 @@ struct mdss_prefill_data {
 	u32 post_scaler_pixels;
 	u32 pp_pixels;
 	u32 fbc_lines;
+};
+
+enum mdss_hw_index {
+	MDSS_HW_MDP,
+	MDSS_HW_DSI0,
+	MDSS_HW_DSI1,
+	MDSS_HW_HDMI,
+	MDSS_HW_EDP,
+	MDSS_MAX_HW_BLK
 };
 
 struct mdss_data_type {
@@ -174,6 +185,7 @@ struct mdss_data_type {
 	u32 nintf;
 
 	u32 pp_bus_hdl;
+	struct mdss_mdp_ad *ad_off;
 	struct mdss_ad_info *ad_cfgs;
 	u32 nad_cfgs;
 	u32 nmax_concurrent_ad_hw;
@@ -189,21 +201,18 @@ struct mdss_data_type {
 	struct mdss_debug_inf debug_inf;
 	int current_bus_idx;
 	bool mixer_switched;
-	bool ulps;
+	struct mdss_panel_cfg pan_cfg;
 
 	int handoff_pending;
 	struct mdss_prefill_data prefill_data;
-};
-extern struct mdss_data_type *mdss_res;
+	bool ulps;
+	int iommu_ref_cnt;
 
-enum mdss_hw_index {
-	MDSS_HW_MDP,
-	MDSS_HW_DSI0,
-	MDSS_HW_DSI1,
-	MDSS_HW_HDMI,
-	MDSS_HW_EDP,
-	MDSS_MAX_HW_BLK
+	u64 ab[MDSS_MAX_HW_BLK];
+	u64 ib[MDSS_MAX_HW_BLK];
 };
+
+extern struct mdss_data_type *mdss_res;
 
 struct mdss_hw {
 	u32 hw_ndx;
@@ -215,7 +224,9 @@ int mdss_register_irq(struct mdss_hw *hw);
 void mdss_enable_irq(struct mdss_hw *hw);
 void mdss_disable_irq(struct mdss_hw *hw);
 void mdss_disable_irq_nosync(struct mdss_hw *hw);
-int mdss_bus_bandwidth_ctrl(int enable);
+void mdss_bus_bandwidth_ctrl(int enable);
+int mdss_iommu_ctrl(int enable);
+int mdss_bus_scale_set_quota(int client, u64 ab_quota, u64 ib_quota);
 
 static inline struct ion_client *mdss_get_ionclient(void)
 {

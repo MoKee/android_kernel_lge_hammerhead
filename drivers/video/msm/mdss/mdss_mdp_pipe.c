@@ -278,7 +278,7 @@ int mdss_mdp_smp_reserve(struct mdss_mdp_pipe *pipe)
 
 		if (pipe->mixer && pipe->mixer->rotator_mode) {
 			rot_mode = 1;
-		} else if (ps.num_planes == 1) {
+		} else if (pipe->mixer && (ps.num_planes == 1)) {
 			ps.ystride[0] = MAX_BPP *
 				max(pipe->mixer->width, width);
 		} else if (mdata->has_decimation) {
@@ -923,8 +923,17 @@ static int mdss_mdp_image_setup(struct mdss_mdp_pipe *pipe,
 	dst = pipe->dst;
 	src = pipe->src;
 
-	if (pipe->mixer->type == MDSS_MDP_MIXER_TYPE_INTF)
+	if (pipe->mixer->type == MDSS_MDP_MIXER_TYPE_INTF) {
 		mdss_mdp_crop_rect(&src, &dst, &sci);
+		if (pipe->flags & MDP_FLIP_LR) {
+			src.x = pipe->src.x + (pipe->src.x + pipe->src.w)
+				- (src.x + src.w);
+		}
+		if (pipe->flags & MDP_FLIP_UD) {
+			src.y = pipe->src.y + (pipe->src.y + pipe->src.h)
+				- (src.y + src.h);
+		}
+	}
 
 	src_size = (src.h << 16) | src.w;
 	src_xy = (src.y << 16) | src.x;

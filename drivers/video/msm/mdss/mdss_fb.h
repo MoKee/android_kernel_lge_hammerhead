@@ -154,6 +154,7 @@ struct msm_fb_data_type {
 	unsigned long cursor_buf_phys;
 	unsigned long cursor_buf_iova;
 
+	int ext_ad_ctrl;
 	u32 ext_bl_ctrl;
 	u32 calib_mode;
 	u32 bl_level;
@@ -188,6 +189,9 @@ struct msm_fb_data_type {
 	bool shutdown_pending;
 
 	struct msm_fb_splash_info splash_info;
+
+	wait_queue_head_t ioctl_q;
+	atomic_t ioctl_ref_cnt;
 
 	struct msm_fb_backup_type msm_fb_backup;
 	struct completion power_set_comp;

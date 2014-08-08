@@ -657,9 +657,11 @@ int mdss_mdp_overlay_get_buf(struct msm_fb_data_type *mfd,
 	if ((num_planes <= 0) || (num_planes > MAX_PLANES))
 		return -EINVAL;
 
-	rc = mdss_bus_bandwidth_ctrl(1);
-	if (rc)
+	rc = mdss_iommu_ctrl(1);
+	if (IS_ERR_VALUE(rc)) {
+		pr_err("Iommu attach failed");
 		goto end;
+	}
 
 	memset(data, 0, sizeof(*data));
 	for (i = 0; i < num_planes; i++) {
@@ -674,31 +676,29 @@ int mdss_mdp_overlay_get_buf(struct msm_fb_data_type *mfd,
 			break;
 		}
 	}
-	mdss_bus_bandwidth_ctrl(0);
 
+	mdss_iommu_ctrl(0);
 	data->num_planes = i;
-
 end:
 	return rc;
 }
 
 int mdss_mdp_overlay_free_buf(struct mdss_mdp_data *data)
 {
-	int i;
-	int rc;
+	int i, rc;
 
-	rc = mdss_bus_bandwidth_ctrl(1);
-	if (rc)
-		goto end;
+	rc = mdss_iommu_ctrl(1);
+	if (IS_ERR_VALUE(rc)) {
+		pr_err("Iommu attach failed");
+		return rc;
+	}
 
 	for (i = 0; i < data->num_planes && data->p[i].len; i++)
 		mdss_mdp_put_img(&data->p[i]);
-	mdss_bus_bandwidth_ctrl(0);
 
+	mdss_iommu_ctrl(0);
 	data->num_planes = 0;
-
-end:
-	return rc;
+	return 0;
 }
 
 /**
@@ -880,7 +880,6 @@ int mdss_mdp_overlay_start(struct msm_fb_data_type *mfd)
 		if (ctl->mfd->index == 0)
 			kcal_pdata->refresh_display();
 #endif
-
 		mdss_mdp_release_splash_pipe(mfd);
 		return 0;
 	}
@@ -903,13 +902,14 @@ int mdss_mdp_overlay_start(struct msm_fb_data_type *mfd)
 	 */
 	if (!is_mdss_iommu_attached()) {
 		if (!mfd->panel_info->cont_splash_enabled) {
-			rc = mdss_iommu_attach(mdss_res);
-			if (rc) {
-				pr_err("mdss iommu attach failed rc=%d\n", rc);
+			rc = mdss_iommu_ctrl(1);
+			if (IS_ERR_VALUE(rc)) {
+				pr_err("iommu attach failed rc=%d\n", rc);
 				goto pm_error;
 			}
+			mdss_hw_init(mdss_res);
+			mdss_iommu_ctrl(0);
 		}
-		mdss_hw_init(mdss_res);
 	}
 
 	rc = mdss_mdp_ctl_start(ctl, false);
@@ -1340,15 +1340,6 @@ static int mdss_mdp_overlay_queue(struct msm_fb_data_type *mfd,
 		pr_warn("Unexpected buffer queue to a solid fill pipe\n");
 
 	flags = (pipe->flags & MDP_SECURE_OVERLAY_SESSION);
-	flags |= (pipe->flags & MDP_SECURE_DISPLAY_OVERLAY_SESSION);
-
-	if (!mfd->panel_info->cont_splash_enabled) {
-		ret = mdss_iommu_attach(mdata);
-		if (ret) {
-			pr_err("mdss iommu attach failed ret=%d\n", ret);
-			goto end;
-		}
-	}
 
 	src_data = &pipe->back_buf;
 	if (src_data->num_planes) {
@@ -1362,7 +1353,6 @@ static int mdss_mdp_overlay_queue(struct msm_fb_data_type *mfd,
 		pr_err("src_data pmem error\n");
 	}
 
-end:
 	mdss_mdp_pipe_unmap(pipe);
 
 	return ret;
@@ -1569,6 +1559,13 @@ static void mdss_mdp_overlay_pan_display(struct msm_fb_data_type *mfd)
 	}
 
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+
+	ret = mdss_iommu_ctrl(1);
+	if (IS_ERR_VALUE(ret)) {
+		pr_err("IOMMU attach failed\n");
+		goto pan_display_error;
+	}
+
 	bpp = fbi->var.bits_per_pixel / 8;
 	offset = fbi->var.xoffset * bpp +
 		 fbi->var.yoffset * fbi->fix.line_length;
@@ -1635,10 +1632,12 @@ static void mdss_mdp_overlay_pan_display(struct msm_fb_data_type *mfd)
 	    (fbi->var.activate & FB_ACTIVATE_FORCE))
 		mfd->mdp.kickoff_fnc(mfd, NULL);
 
+	mdss_iommu_ctrl(0);
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	return;
 
 pan_display_error:
+	mdss_iommu_ctrl(0);
 	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 	mutex_unlock(&mdp5_data->ov_lock);
 }
@@ -1863,6 +1862,8 @@ static int mdss_mdp_hw_cursor_update(struct msm_fb_data_type *mfd,
 
 	mixer = mdss_mdp_mixer_get(mdp5_data->ctl, MDSS_MDP_MIXER_MUX_DEFAULT);
 	off = MDSS_MDP_REG_LM_OFFSET(mixer->num);
+	if (!mixer)
+		return -ENODEV;
 
 	if ((img->width > MDSS_MDP_CURSOR_WIDTH) ||
 		(img->height > MDSS_MDP_CURSOR_HEIGHT) ||
@@ -1988,6 +1989,11 @@ static int mdss_mdp_pp_ioctl(struct msm_fb_data_type *mfd,
 	u32 copyback = 0;
 	u32 copy_from_kernel = 0;
 
+	if (mfd->panel_info->partial_update_enabled) {
+		pr_err("Partical update feature is enabled.");
+		return -EPERM;
+	}
+
 	ret = copy_from_user(&mdp_pp, argp, sizeof(mdp_pp));
 	if (ret)
 		return ret;
@@ -2095,6 +2101,11 @@ static int mdss_mdp_histo_ioctl(struct msm_fb_data_type *mfd, u32 cmd,
 	u32 block;
 	u32 pp_bus_handle;
 	static int req = -1;
+
+	if (mfd->panel_info->partial_update_enabled) {
+		pr_err("Partical update feature is enabled.");
+		return -EPERM;
+	}
 
 	switch (cmd) {
 	case MSMFB_HISTOGRAM_START:
@@ -2638,11 +2649,6 @@ static int mdss_mdp_overlay_off(struct msm_fb_data_type *mfd)
 	need_cleanup = !list_empty(&mdp5_data->pipes_cleanup);
 	mutex_unlock(&mfd->lock);
 
-	if (need_cleanup) {
-		pr_debug("cleaning up pipes on fb%d\n", mfd->index);
-		mdss_mdp_overlay_kickoff(mfd, NULL);
-	}
-
 	if (mdp5_data->mdata->ulps) {
 		rc = mdss_mdp_footswitch_ctrl_ulps(1, &mfd->pdev->dev);
 		if (rc) {
@@ -2651,6 +2657,11 @@ static int mdss_mdp_overlay_off(struct msm_fb_data_type *mfd)
 			return rc;
 		}
 		mdss_mdp_ctl_restore(mdp5_data->ctl);
+	}
+
+	if (need_cleanup) {
+		pr_debug("cleaning up pipes on fb%d\n", mfd->index);
+		mdss_mdp_overlay_kickoff(mfd, NULL);
 	}
 
 	/*
@@ -2958,12 +2969,6 @@ int mdss_mdp_overlay_init(struct msm_fb_data_type *mfd)
 		goto init_fail;
 	}
 
-	rc = sysfs_create_link_nowarn(&dev->kobj,
-			&mdp5_data->mdata->pdev->dev.kobj, "mdp");
-	if (rc)
-		pr_warn("problem creating link to mdp sysfs\n");
-
-	mfd->mdp_sync_pt_data.async_wait_fences = true;
 	if (mfd->panel_info->type == MIPI_CMD_PANEL) {
 		rc = __vsync_retire_setup(mfd);
 		if (IS_ERR_VALUE(rc)) {
@@ -2971,7 +2976,12 @@ int mdss_mdp_overlay_init(struct msm_fb_data_type *mfd)
 			goto init_fail;
 		}
 	}
+
 	mfd->mdp_sync_pt_data.async_wait_fences = true;
+	rc = sysfs_create_link_nowarn(&dev->kobj,
+			&mdp5_data->mdata->pdev->dev.kobj, "mdp");
+	if (rc)
+		pr_warn("problem creating link to mdp sysfs\n");
 
 	pm_runtime_set_suspended(&mfd->pdev->dev);
 	pm_runtime_enable(&mfd->pdev->dev);

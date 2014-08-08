@@ -53,6 +53,7 @@
 #include "mdss.h"
 #include "mdss_fb.h"
 #include "mdss_mdp.h"
+#include "mdss_panel.h"
 #include "mdss_debug.h"
 
 #define CREATE_TRACE_POINTS
@@ -83,6 +84,12 @@ static DEFINE_SPINLOCK(mdp_lock);
 static DEFINE_MUTEX(mdp_clk_lock);
 static DEFINE_MUTEX(bus_bw_lock);
 static DEFINE_MUTEX(mdp_iommu_lock);
+
+static struct mdss_panel_intf pan_types[] = {
+	{"dsi", MDSS_PANEL_INTF_DSI},
+	{"edp", MDSS_PANEL_INTF_EDP},
+	{"hdmi", MDSS_PANEL_INTF_HDMI},
+};
 
 struct mdss_iommu_map_type mdss_iommu_map[MDSS_IOMMU_MAX_DOMAIN] = {
 	[MDSS_IOMMU_DOMAIN_UNSECURE] = {
@@ -321,7 +328,7 @@ static int mdss_mdp_bus_scale_register(struct mdss_data_type *mdata)
 		pr_debug("register bus_hdl=%x\n", mdata->bus_hdl);
 	}
 
-	return mdss_mdp_bus_scale_set_quota(AB_QUOTA, IB_QUOTA);
+	return mdss_bus_scale_set_quota(MDSS_HW_MDP, AB_QUOTA, IB_QUOTA);
 }
 
 static void mdss_mdp_bus_scale_unregister(struct mdss_data_type *mdata)
@@ -386,6 +393,29 @@ int mdss_mdp_bus_scale_set_quota(u64 ab_quota, u64 ib_quota)
 
 	return msm_bus_scale_client_update_request(mdss_res->bus_hdl,
 		new_uc_idx);
+}
+
+int mdss_bus_scale_set_quota(int client, u64 ab_quota, u64 ib_quota)
+{
+	int rc = 0;
+	int i;
+	u64 total_ab = 0;
+	u64 total_ib = 0;
+
+	mutex_lock(&bus_bw_lock);
+
+	mdss_res->ab[client] = ab_quota;
+	mdss_res->ib[client] = ib_quota;
+	for (i = 0; i < MDSS_MAX_HW_BLK; i++) {
+		total_ab += mdss_res->ab[i];
+		total_ib = max(total_ib, mdss_res->ib[i]);
+	}
+
+	rc = mdss_mdp_bus_scale_set_quota(total_ab, total_ib);
+
+	mutex_unlock(&bus_bw_lock);
+
+	return rc;
 }
 
 static inline u32 mdss_mdp_irq_mask(u32 intr_type, u32 intf_num)
@@ -612,6 +642,37 @@ unsigned long mdss_mdp_get_clk_rate(u32 clk_idx)
 	return clk_rate;
 }
 
+int mdss_iommu_ctrl(int enable)
+{
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+	int rc = 0;
+
+	mutex_lock(&mdp_iommu_lock);
+	pr_debug("%pS: enable %d mdata->iommu_ref_cnt %d\n",
+		__builtin_return_address(0), enable, mdata->iommu_ref_cnt);
+
+	if (enable) {
+
+		if (mdata->iommu_ref_cnt == 0)
+			rc = mdss_iommu_attach(mdata);
+		mdata->iommu_ref_cnt++;
+	} else {
+		if (mdata->iommu_ref_cnt) {
+			mdata->iommu_ref_cnt--;
+			if (mdata->iommu_ref_cnt == 0)
+				rc = mdss_iommu_dettach(mdata);
+		} else {
+			pr_err("unbalanced iommu ref\n");
+		}
+	}
+	mutex_unlock(&mdp_iommu_lock);
+
+	if (IS_ERR_VALUE(rc))
+		return rc;
+	else
+		return mdata->iommu_ref_cnt;
+}
+
 /**
  * mdss_bus_bandwidth_ctrl() -- place bus bandwidth request
  * @enable:	value of enable or disable
@@ -621,27 +682,16 @@ unsigned long mdss_mdp_get_clk_rate(u32 clk_idx)
  * Bus bandwidth is required by mdp.For dsi, it only requires to send
  * dcs coammnd. It returns error if bandwidth request fails.
  */
-int mdss_bus_bandwidth_ctrl(int enable)
+void mdss_bus_bandwidth_ctrl(int enable)
 {
 	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
 	static int bus_bw_cnt;
 	int changed = 0;
-	int rc = 0;
 
 	mutex_lock(&bus_bw_lock);
 	if (enable) {
-		if (bus_bw_cnt == 0) {
+		if (bus_bw_cnt == 0)
 			changed++;
-			if (!mdata->handoff_pending) {
-				rc = mdss_iommu_attach(mdata);
-				if (rc) {
-					pr_err("iommu attach failed rc=%d\n",
-									rc);
-					goto end;
-				}
-			}
-		}
-
 		bus_bw_cnt++;
 	} else {
 		if (bus_bw_cnt) {
@@ -660,7 +710,6 @@ int mdss_bus_bandwidth_ctrl(int enable)
 		if (!enable) {
 			msm_bus_scale_client_update_request(
 				mdata->bus_hdl, 0);
-			mdss_iommu_dettach(mdata);
 			pm_runtime_put(&mdata->pdev->dev);
 		} else {
 			pm_runtime_get_sync(&mdata->pdev->dev);
@@ -669,9 +718,7 @@ int mdss_bus_bandwidth_ctrl(int enable)
 		}
 	}
 
-end:
 	mutex_unlock(&bus_bw_lock);
-	return rc;
 }
 EXPORT_SYMBOL(mdss_bus_bandwidth_ctrl);
 
@@ -679,7 +726,7 @@ void mdss_mdp_clk_ctrl(int enable, int isr)
 {
 	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
 	static int mdp_clk_cnt;
-	int changed = 0, rc;
+	int changed = 0;
 
 	mutex_lock(&mdp_clk_lock);
 	if (enable) {
@@ -712,9 +759,7 @@ void mdss_mdp_clk_ctrl(int enable, int isr)
 		if (mdata->vsync_ena)
 			mdss_mdp_clk_update(MDSS_CLK_MDP_VSYNC, enable);
 
-		rc = mdss_bus_bandwidth_ctrl(enable);
-		if (rc)
-			pr_err("bus bandwidth control failed rc=%d", rc);
+		mdss_bus_bandwidth_ctrl(enable);
 
 		if (!enable)
 			pm_runtime_put(&mdata->pdev->dev);
@@ -801,7 +846,6 @@ int mdss_iommu_attach(struct mdss_data_type *mdata)
 	struct mdss_iommu_map_type *iomap;
 	int i, rc = 0;
 
-	mutex_lock(&mdp_iommu_lock);
 	MDSS_XLOG(mdata->iommu_attached);
 
 	if (mdata->iommu_attached) {
@@ -832,8 +876,6 @@ int mdss_iommu_attach(struct mdss_data_type *mdata)
 
 	mdata->iommu_attached = true;
 end:
-	mutex_unlock(&mdp_iommu_lock);
-
 	return rc;
 }
 
@@ -843,12 +885,10 @@ int mdss_iommu_dettach(struct mdss_data_type *mdata)
 	struct mdss_iommu_map_type *iomap;
 	int i;
 
-	mutex_lock(&mdp_iommu_lock);
 	MDSS_XLOG(mdata->iommu_attached);
 
 	if (!mdata->iommu_attached) {
 		pr_debug("mdp iommu already dettached\n");
-		mutex_unlock(&mdp_iommu_lock);
 		return 0;
 	}
 
@@ -865,7 +905,6 @@ int mdss_iommu_dettach(struct mdss_data_type *mdata)
 	}
 
 	mdata->iommu_attached = false;
-	mutex_unlock(&mdp_iommu_lock);
 
 	return 0;
 }
@@ -1351,6 +1390,185 @@ int mdss_mdp_parse_dt_hw_settings(struct platform_device *pdev)
 	return 0;
 }
 
+static int mdss_mdp_get_pan_intf(const char *pan_intf)
+{
+	int i, rc = MDSS_PANEL_INTF_INVALID;
+
+	if (!pan_intf)
+		return rc;
+
+	for (i = 0; i < ARRAY_SIZE(pan_types); i++) {
+		if (!strncmp(pan_intf, pan_types[i].name, MDSS_MAX_PANEL_LEN)) {
+			rc = pan_types[i].type;
+			break;
+		}
+	}
+	return rc;
+}
+
+static int mdss_mdp_get_pan_cfg(struct mdss_panel_cfg *pan_cfg)
+{
+	char *t = NULL;
+	char pan_intf_str[MDSS_MAX_PANEL_LEN];
+	int rc, i;
+	char pan_name[MDSS_MAX_PANEL_LEN];
+
+	if (!pan_cfg)
+		return -EINVAL;
+
+	strlcpy(pan_name, &pan_cfg->arg_cfg[0], sizeof(pan_cfg->arg_cfg));
+	if (pan_name[0] == '0') {
+		pan_cfg->lk_cfg = false;
+	} else if (pan_name[0] == '1') {
+		pan_cfg->lk_cfg = true;
+	} else {
+		/* read from dt */
+		pan_cfg->lk_cfg = true;
+		pan_cfg->pan_intf = MDSS_PANEL_INTF_INVALID;
+		return -EINVAL;
+	}
+
+	/* skip lk cfg and delimiter; ex: "0:" */
+	strlcpy(pan_name, &pan_name[2], MDSS_MAX_PANEL_LEN);
+	t = strnstr(pan_name, ":", MDSS_MAX_PANEL_LEN);
+	if (!t) {
+		pr_err("%s: pan_name=[%s] invalid\n",
+			__func__, pan_name);
+		pan_cfg->pan_intf = MDSS_PANEL_INTF_INVALID;
+		return -EINVAL;
+	}
+
+	for (i = 0; ((pan_name + i) < t) && (i < 4); i++)
+		pan_intf_str[i] = *(pan_name + i);
+	pan_intf_str[i] = 0;
+	pr_debug("%s:%d panel intf %s\n", __func__, __LINE__, pan_intf_str);
+	/* point to the start of panel name */
+	t = t + 1;
+	strlcpy(&pan_cfg->arg_cfg[0], t, sizeof(pan_cfg->arg_cfg));
+	pr_debug("%s:%d: t=[%s] panel name=[%s]\n", __func__, __LINE__,
+		t, pan_cfg->arg_cfg);
+	rc = mdss_mdp_get_pan_intf(pan_intf_str);
+	pan_cfg->pan_intf = (rc < 0) ?  MDSS_PANEL_INTF_INVALID : rc;
+	return 0;
+}
+
+static int mdss_mdp_parse_dt_pan_intf(struct platform_device *pdev)
+{
+	int rc;
+	struct mdss_data_type *mdata = platform_get_drvdata(pdev);
+	const char *prim_intf = NULL;
+
+	rc = of_property_read_string(pdev->dev.of_node,
+				"qcom,mdss-pref-prim-intf", &prim_intf);
+	if (rc)
+		return -ENODEV;
+
+	rc = mdss_mdp_get_pan_intf(prim_intf);
+	if (rc < 0) {
+		mdata->pan_cfg.pan_intf = MDSS_PANEL_INTF_INVALID;
+	} else {
+		mdata->pan_cfg.pan_intf = rc;
+		rc = 0;
+	}
+	return rc;
+}
+
+static int mdss_mdp_parse_bootarg(struct platform_device *pdev)
+{
+	struct device_node *chosen_node;
+	static const char *cmd_line;
+	char *disp_idx, *end_idx;
+	int rc, len = 0, name_len, cmd_len;
+	int *intf_type;
+	char *panel_name;
+	struct mdss_panel_cfg *pan_cfg;
+	struct mdss_data_type *mdata = platform_get_drvdata(pdev);
+
+	mdata->pan_cfg.arg_cfg[MDSS_MAX_PANEL_LEN] = 0;
+	pan_cfg = &mdata->pan_cfg;
+	panel_name = &pan_cfg->arg_cfg[0];
+	intf_type = &pan_cfg->pan_intf;
+
+	/* reads from dt by default */
+	pan_cfg->lk_cfg = true;
+
+	chosen_node = of_find_node_by_name(NULL, "chosen");
+	if (!chosen_node) {
+		pr_err("%s: get chosen node failed\n", __func__);
+		rc = -ENODEV;
+		goto get_dt_pan;
+	}
+
+	cmd_line = of_get_property(chosen_node, "bootargs", &len);
+	if (!cmd_line || len <= 0) {
+		pr_err("%s: get bootargs failed\n", __func__);
+		rc = -ENODEV;
+		goto get_dt_pan;
+	}
+
+	name_len = strlen("mdss_mdp.panel=");
+	cmd_len = strlen(cmd_line);
+	disp_idx = strnstr(cmd_line, "mdss_mdp.panel=", cmd_len);
+	if (!disp_idx) {
+		pr_err("%s:%d:cmdline panel not set disp_idx=[%p]\n",
+				__func__, __LINE__, disp_idx);
+		memset(panel_name, 0x00, MDSS_MAX_PANEL_LEN);
+		*intf_type = MDSS_PANEL_INTF_INVALID;
+		rc = MDSS_PANEL_INTF_INVALID;
+		goto get_dt_pan;
+	}
+
+	disp_idx += name_len;
+
+	end_idx = strnstr(disp_idx, " ", MDSS_MAX_PANEL_LEN);
+	pr_debug("%s:%d: pan_name=[%s] end=[%s]\n", __func__, __LINE__,
+		 disp_idx, end_idx);
+	if (!end_idx) {
+		end_idx = disp_idx + strlen(disp_idx) + 1;
+		pr_warn("%s:%d: pan_name=[%s] end=[%s]\n", __func__,
+		       __LINE__, disp_idx, end_idx);
+	}
+
+	if (end_idx <= disp_idx) {
+		pr_err("%s:%d:cmdline pan incorrect end=[%p] disp=[%p]\n",
+			__func__, __LINE__, end_idx, disp_idx);
+		memset(panel_name, 0x00, MDSS_MAX_PANEL_LEN);
+		*intf_type = MDSS_PANEL_INTF_INVALID;
+		rc = MDSS_PANEL_INTF_INVALID;
+		goto get_dt_pan;
+	}
+
+	*end_idx = 0;
+	len = end_idx - disp_idx + 1;
+	if (len <= 0) {
+		pr_warn("%s: panel name not rx", __func__);
+		rc = -EINVAL;
+		goto get_dt_pan;
+	}
+
+	strlcpy(panel_name, disp_idx, min(++len, MDSS_MAX_PANEL_LEN));
+	pr_debug("%s:%d panel:[%s]", __func__, __LINE__, panel_name);
+	of_node_put(chosen_node);
+
+	rc = mdss_mdp_get_pan_cfg(pan_cfg);
+	if (!rc)
+		pan_cfg->init_done = true;
+
+	return rc;
+
+get_dt_pan:
+	rc = mdss_mdp_parse_dt_pan_intf(pdev);
+	/* if pref pan intf is not present */
+	if (rc)
+		pr_err("%s:unable to parse device tree for pan intf\n",
+			__func__);
+	else
+		pan_cfg->init_done = true;
+
+	of_node_put(chosen_node);
+	return rc;
+}
+
 static int mdss_mdp_parse_dt(struct platform_device *pdev)
 {
 	int rc;
@@ -1412,6 +1630,18 @@ static int mdss_mdp_parse_dt(struct platform_device *pdev)
 	rc = mdss_mdp_parse_dt_bus_scale(pdev);
 	if (rc) {
 		pr_err("Error in device tree : bus scale\n");
+		return rc;
+	}
+
+	rc = mdss_mdp_parse_dt_pan_intf(pdev);
+	/* if pref pan intf is not present */
+	if (rc)
+		pr_warn("Error in device tree : pan_intf\n");
+
+	rc = mdss_mdp_parse_bootarg(pdev);
+	if (rc) {
+		pr_err("%s: Error in panel override:rc=[%d]\n",
+		       __func__, rc);
 		return rc;
 	}
 
@@ -2226,7 +2456,7 @@ static int mdss_mdp_parse_dt_prop_len(struct platform_device *pdev,
 	return len;
 }
 
-struct mdss_data_type *mdss_mdp_get_mdata()
+struct mdss_data_type *mdss_mdp_get_mdata(void)
 {
 	return mdss_res;
 }
@@ -2301,6 +2531,56 @@ void mdss_mdp_batfet_ctrl(struct mdss_data_type *mdata, int enable)
 		regulator_disable(mdata->batfet);
 }
 
+/**
+ * mdss_is_ready() - checks if mdss is probed and ready
+ *
+ * Checks if mdss resources have been initialized
+ *
+ * returns true if mdss is ready, else returns false
+ */
+bool mdss_is_ready(void)
+{
+	return mdss_mdp_get_mdata() ? true : false;
+}
+EXPORT_SYMBOL(mdss_is_ready);
+
+/**
+ * mdss_panel_intf_type() - checks if a given intf type is primary
+ * @intf_val: panel interface type of the individual controller
+ *
+ * Individual controller queries with MDP to check if it is
+ * configured as the primary interface.
+ *
+ * returns a pointer to the configured structure mdss_panel_cfg
+ * to the controller that's configured as the primary panel interface.
+ * returns NULL on error or if @intf_val is not the configured
+ * controller.
+ */
+struct mdss_panel_cfg *mdss_panel_intf_type(int intf_val)
+{
+	if (!mdss_res || !mdss_res->pan_cfg.init_done)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	if (mdss_res->pan_cfg.pan_intf == intf_val)
+		return &mdss_res->pan_cfg;
+	else
+		return NULL;
+}
+EXPORT_SYMBOL(mdss_panel_intf_type);
+
+int mdss_panel_get_boot_cfg(void)
+{
+	int rc;
+
+	if (!mdss_res || !mdss_res->pan_cfg.init_done)
+		rc = -EPROBE_DEFER;
+	if (mdss_res->pan_cfg.lk_cfg)
+		rc = 1;
+	else
+		rc = 0;
+	return rc;
+}
+
 static void mdss_mdp_footswitch_ctrl(struct mdss_data_type *mdata, int on)
 {
 	if (!mdata->fs)
@@ -2318,7 +2598,6 @@ static void mdss_mdp_footswitch_ctrl(struct mdss_data_type *mdata, int on)
 		mdata->fs_ena = true;
 	} else {
 		pr_debug("Disable MDP FS\n");
-		mdss_iommu_dettach(mdata);
 		if (mdata->fs_ena) {
 			regulator_disable(mdata->fs);
 			if (!mdata->ulps) {
@@ -2349,20 +2628,20 @@ int mdss_mdp_footswitch_ctrl_ulps(int on, struct device *dev)
 	pr_debug("called on=%d\n", on);
 	if (on) {
 		pm_runtime_get_sync(dev);
-		rc = mdss_iommu_attach(mdata);
-		if (rc) {
+		rc = mdss_iommu_ctrl(1);
+		if (IS_ERR_VALUE(rc)) {
 			pr_err("mdss iommu attach failed rc=%d\n", rc);
-			goto end;
+			return rc;
 		}
 		mdss_hw_init(mdata);
 		mdata->ulps = false;
+		mdss_iommu_ctrl(0);
 	} else {
 		mdata->ulps = true;
 		pm_runtime_put_sync(dev);
 	}
 
-end:
-	return rc;
+	return 0;
 }
 
 static inline int mdss_mdp_suspend_sub(struct mdss_data_type *mdata)

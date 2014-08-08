@@ -295,15 +295,19 @@ struct pp_hist_col_info {
 	u32 hist_cnt_sent;
 	u32 hist_cnt_time;
 	u32 frame_cnt;
-	u32 is_kick_ready;
 	struct completion comp;
+	struct completion first_kick;
 	u32 data[HIST_V_SIZE];
 	struct mutex hist_mutex;
 	spinlock_t hist_lock;
 };
 
-struct mdss_ad_info {
+struct mdss_mdp_ad {
 	char __iomem *base;
+	u8 num;
+};
+
+struct mdss_ad_info {
 	u8 num;
 	u32 sts;
 	u32 state;
@@ -314,14 +318,17 @@ struct mdss_ad_info {
 	struct mutex lock;
 	struct work_struct calc_work;
 	struct msm_fb_data_type *mfd;
+	struct msm_fb_data_type *bl_mfd;
 	struct mdss_mdp_vsync_handler handle;
 	struct completion comp;
 	u32 last_str;
 	u32 last_bl;
+	u32 bl_data;
 	u32 calc_itr;
 	uint32_t bl_bright_shift;
 	uint32_t bl_lin[AD_BL_LIN_LEN];
 	uint32_t bl_lin_inv[AD_BL_LIN_LEN];
+	uint32_t bl_att_lut[AD_BL_ATT_LUT_LEN];
 };
 
 struct pp_sts_type {
@@ -619,7 +626,7 @@ int mdss_mdp_ad_config(struct msm_fb_data_type *mfd,
 				struct mdss_ad_init_cfg *init_cfg);
 int mdss_mdp_ad_input(struct msm_fb_data_type *mfd,
 				struct mdss_ad_input *input, int wait);
-int mdss_mdp_ad_addr_setup(struct mdss_data_type *mdata, u32 *ad_off);
+int mdss_mdp_ad_addr_setup(struct mdss_data_type *mdata, u32 *ad_offsets);
 int mdss_mdp_calib_mode(struct msm_fb_data_type *mfd,
 				struct mdss_calib_cfg *cfg);
 
