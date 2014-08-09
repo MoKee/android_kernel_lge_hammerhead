@@ -507,7 +507,6 @@ static void touch_recover_func(struct work_struct *work_recover)
 				struct synaptics_ts_data, work_recover);
 
 	disable_irq(ts->client->irq);
-
 	safety_reset(ts);
 	touch_ic_init(ts);
 	enable_irq(ts->client->irq);
@@ -539,7 +538,6 @@ static int touch_ic_init(struct synaptics_ts_data *ts)
 err_out_retry:
 	ts->ic_init_err_cnt++;
 	disable_irq_nosync(ts->client->irq);
-
 	safety_reset(ts);
 	queue_delayed_work(synaptics_wq, &ts->work_init, msecs_to_jiffies(10));
 
@@ -1672,6 +1670,7 @@ static int lcd_notifier_callback(struct notifier_block *this,
 {
 	struct synaptics_ts_data *ts =
 		container_of(this, struct synaptics_ts_data, notif);
+
 #ifdef CONFIG_TOUCHSCREEN_PREVENT_SLEEP
 #if defined(CONFIG_TOUCHSCREEN_SWEEP2WAKE) || defined(CONFIG_TOUCHSCREEN_DOUBLETAP2WAKE)
 	bool prevent_sleep = false;
