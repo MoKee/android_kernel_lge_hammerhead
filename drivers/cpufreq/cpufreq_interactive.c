@@ -54,6 +54,7 @@ struct cpufreq_interactive_cpuinfo {
 	unsigned int max_freq;
 	u64 floor_validate_time;
 	u64 hispeed_validate_time;
+	u64 max_freq_idle_start_time;
 	struct rw_semaphore enable_sem;
 	int governor_enabled;
 };
@@ -117,15 +118,35 @@ static u64 boostpulse_endtime;
 #define DEFAULT_TIMER_SLACK (4 * DEFAULT_TIMER_RATE)
 static int timer_slack_val = DEFAULT_TIMER_SLACK;
 
+/*
+ * Whether to align timer windows across all CPUs. When
+ * use_sched_load is true, this flag is ignored and windows
+ * will always be aligned.
+ */
+static bool align_windows = true;
+
+/*
+ * Stay at max freq for at least max_freq_hysteresis before dropping
+ * frequency.
+ */
+static unsigned int max_freq_hysteresis;
+
 static bool io_is_busy;
 
 /* Round to starting jiffy of next evaluation window */
 static u64 round_to_nw_start(u64 jif)
 {
 	unsigned long step = usecs_to_jiffies(timer_rate);
+	u64 ret;
 
-	do_div(jif, step);
-	return (jif + 1) * step;
+	if (align_windows) {
+		do_div(jif, step);
+		ret = (jif + 1) * step;
+	} else {
+		ret = jiffies + usecs_to_jiffies(timer_rate);
+	}
+
+	return ret;
 }
 
 static void cpufreq_interactive_timer_resched(unsigned long cpu)
@@ -364,11 +385,11 @@ static void cpufreq_interactive_timer(unsigned long data)
 	spin_lock_irqsave(&pcpu->target_freq_lock, flags);
 	do_div(cputime_speedadj, delta_time);
 	loadadjfreq = (unsigned int)cputime_speedadj * 100;
-	cpu_load = loadadjfreq / pcpu->target_freq;
+	cpu_load = loadadjfreq / pcpu->policy->cur;
 	boosted = boost_val || now < boostpulse_endtime;
 
 	if (cpu_load >= go_hispeed_load || boosted) {
-		if (pcpu->target_freq < hispeed_freq) {
+		if (pcpu->policy->cur < hispeed_freq) {
 			new_freq = hispeed_freq;
 		} else {
 			new_freq = choose_freq(pcpu, loadadjfreq);
@@ -380,18 +401,16 @@ static void cpufreq_interactive_timer(unsigned long data)
 		new_freq = choose_freq(pcpu, loadadjfreq);
 	}
 
-	if (pcpu->target_freq >= hispeed_freq &&
-	    new_freq > pcpu->target_freq &&
+	if (pcpu->policy->cur >= hispeed_freq &&
+	    new_freq > pcpu->policy->cur &&
 	    now - pcpu->hispeed_validate_time <
-	    freq_to_above_hispeed_delay(pcpu->target_freq)) {
+	    freq_to_above_hispeed_delay(pcpu->policy->cur)) {
 		trace_cpufreq_interactive_notyet(
 			data, cpu_load, pcpu->target_freq,
 			pcpu->policy->cur, new_freq);
 		spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
 		goto rearm;
 	}
-
-	pcpu->hispeed_validate_time = now;
 
 	if (cpufreq_frequency_table_target(pcpu->policy, pcpu->freq_table,
 					   new_freq, CPUFREQ_RELATION_L,
@@ -401,6 +420,15 @@ static void cpufreq_interactive_timer(unsigned long data)
 	}
 
 	new_freq = pcpu->freq_table[index].frequency;
+
+	if (pcpu->target_freq >= pcpu->policy->max
+	    && new_freq < pcpu->target_freq
+	    && now - pcpu->max_freq_idle_start_time < max_freq_hysteresis) {
+		trace_cpufreq_interactive_notyet(data, cpu_load,
+			pcpu->target_freq, pcpu->policy->cur, new_freq);
+		spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
+		goto rearm;
+	}
 
 	/*
 	 * Do not scale below floor_freq unless we have been at or above the
@@ -469,6 +497,8 @@ static void cpufreq_interactive_idle_start(void)
 	struct cpufreq_interactive_cpuinfo *pcpu =
 		&per_cpu(cpuinfo, smp_processor_id());
 	int pending;
+	unsigned long flags;
+	u64 now;
 
 	if (!down_read_trylock(&pcpu->enable_sem))
 		return;
@@ -491,6 +521,20 @@ static void cpufreq_interactive_idle_start(void)
 		if (!pending) {
 			pcpu->last_evaluated_jiffy = get_jiffies_64();
 			cpufreq_interactive_timer_resched(smp_processor_id());
+
+			/*
+			 * If timer is cancelled because CPU is running at
+			 * policy->max, record the time CPU first goes to
+			 * idle.
+			 */
+			now = ktime_to_us(ktime_get());
+			if (max_freq_hysteresis) {
+				spin_lock_irqsave(&pcpu->target_freq_lock,
+						  flags);
+				pcpu->max_freq_idle_start_time = now;
+				spin_unlock_irqrestore(&pcpu->target_freq_lock,
+						       flags);
+			}
 		}
 	}
 
@@ -551,6 +595,7 @@ static int cpufreq_interactive_speedchange_task(void *data)
 		for_each_cpu(cpu, &tmp_mask) {
 			unsigned int j;
 			unsigned int max_freq = 0;
+			struct cpufreq_interactive_cpuinfo *pjcpu;
 
 			pcpu = &per_cpu(cpuinfo, cpu);
 			if (!down_read_trylock(&pcpu->enable_sem))
@@ -561,17 +606,23 @@ static int cpufreq_interactive_speedchange_task(void *data)
 			}
 
 			for_each_cpu(j, pcpu->policy->cpus) {
-				struct cpufreq_interactive_cpuinfo *pjcpu =
-					&per_cpu(cpuinfo, j);
+				pjcpu = &per_cpu(cpuinfo, j);
 
 				if (pjcpu->target_freq > max_freq)
 					max_freq = pjcpu->target_freq;
 			}
 
-			if (max_freq != pcpu->policy->cur)
+			if (max_freq != pcpu->policy->cur) {
+				u64 now;
 				__cpufreq_driver_target(pcpu->policy,
 							max_freq,
 							CPUFREQ_RELATION_H);
+				now = ktime_to_us(ktime_get());
+				for_each_cpu(j, pcpu->policy->cpus) {
+					pjcpu = &per_cpu(cpuinfo, j);
+					pjcpu->hispeed_validate_time = now;
+				}
+			}
 			trace_cpufreq_interactive_setspeed(cpu,
 						     pcpu->target_freq,
 						     pcpu->policy->cur);
@@ -818,6 +869,51 @@ static ssize_t store_hispeed_freq(struct kobject *kobj,
 static struct global_attr hispeed_freq_attr = __ATTR(hispeed_freq, 0644,
 		show_hispeed_freq, store_hispeed_freq);
 
+static ssize_t show_max_freq_hysteresis(struct kobject *kobj,
+				     struct attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", max_freq_hysteresis);
+}
+
+static ssize_t store_max_freq_hysteresis(struct kobject *kobj,
+			struct attribute *attr, const char *buf, size_t count)
+{
+	int ret;
+	unsigned long val;
+
+	ret = strict_strtoul(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	max_freq_hysteresis = val;
+	return count;
+}
+
+static struct global_attr max_freq_hysteresis_attr =
+	__ATTR(max_freq_hysteresis, 0644, show_max_freq_hysteresis,
+		store_max_freq_hysteresis);
+
+static ssize_t show_align_windows(struct kobject *kobj,
+				     struct attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", align_windows);
+}
+
+static ssize_t store_align_windows(struct kobject *kobj,
+			struct attribute *attr, const char *buf, size_t count)
+{
+	int ret;
+	unsigned long val;
+
+	ret = strict_strtoul(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	align_windows = val;
+	return count;
+}
+
+static struct global_attr align_windows_attr = __ATTR(align_windows, 0644,
+		show_align_windows, store_align_windows);
+
 static ssize_t show_go_hispeed_load(struct kobject *kobj,
 				     struct attribute *attr, char *buf)
 {
@@ -1020,6 +1116,8 @@ static struct attribute *interactive_attributes[] = {
 	&boostpulse.attr,
 	&boostpulse_duration.attr,
 	&io_is_busy_attr.attr,
+	&max_freq_hysteresis_attr.attr,
+	&align_windows_attr.attr,
 	NULL,
 };
 
